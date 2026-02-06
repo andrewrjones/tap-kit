@@ -104,9 +104,16 @@ The `subscribers` stream extracts subscriber data from your Kit account.
 - `state` (string): Subscriber state (e.g., "active", "inactive")
 - `created_at` (datetime): When the subscriber was created
 - `fields` (object): Custom fields
+- `stats` (object, nullable): Subscriber engagement statistics
+  - `total_opens` (integer, nullable): Total number of email opens
+  - `total_clicks` (integer, nullable): Total number of email clicks
+  - `average_open_rate` (number, nullable): Average open rate across all emails
+  - `average_click_rate` (number, nullable): Average click rate across all emails
 
 **Replication Method:** INCREMENTAL
 **Replication Key:** `created_at`
+
+**Note:** The tap fetches statistics for each subscriber using a separate API call to include engagement metrics.
 
 ## Development
 

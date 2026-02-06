@@ -54,6 +54,15 @@ class KitAPI:
 
         return response.json()
 
+    def get_subscriber_stats(self, subscriber_id: int) -> Dict[str, Any]:
+        """Fetch stats for a specific subscriber from Kit API"""
+        url = f"{self.base_url}/subscribers/{subscriber_id}/stats"
+
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+
+        return response.json()
+
 
 def get_abs_path(path: str) -> str:
     """Get absolute path"""
@@ -106,6 +115,15 @@ def load_schemas() -> Dict[str, Schema]:
             "state": {"type": "string"},
             "created_at": {"type": "string", "format": "date-time"},
             "fields": {"type": "object"},
+            "stats": {
+                "type": ["null", "object"],
+                "properties": {
+                    "total_opens": {"type": ["null", "integer"]},
+                    "total_clicks": {"type": ["null", "integer"]},
+                    "average_open_rate": {"type": ["null", "number"]},
+                    "average_click_rate": {"type": ["null", "number"]},
+                },
+            },
         },
     }
 
@@ -253,6 +271,14 @@ def sync_subscribers(
             subscribers = response["subscribers"]
 
             for subscriber in subscribers:
+                # Fetch stats for each subscriber
+                try:
+                    stats_response = api.get_subscriber_stats(subscriber["id"])
+                    subscriber["stats"] = stats_response.get("stats")
+                except requests.exceptions.RequestException as e:
+                    LOGGER.warning(f"Error fetching stats for subscriber {subscriber['id']}: {e}")
+                    subscriber["stats"] = None
+
                 # Write record
                 write_record("subscribers", subscriber)
                 total_records += 1
