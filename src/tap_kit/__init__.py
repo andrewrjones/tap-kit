@@ -35,6 +35,15 @@ class KitAPI:
 
         return response.json()
 
+    def get_broadcast_stats(self, broadcast_id: int) -> Dict[str, Any]:
+        """Fetch stats for a specific broadcast from Kit API"""
+        url = f"{self.base_url}/broadcasts/{broadcast_id}/stats"
+
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+
+        return response.json()
+
     def get_subscribers(self, page: int = 1) -> Dict[str, Any]:
         """Fetch subscribers from Kit API"""
         url = f"{self.base_url}/subscribers"
@@ -71,6 +80,19 @@ def load_schemas() -> Dict[str, Schema]:
             "thumbnail_url": {"type": ["null", "string"]},
             "email_address": {"type": "string"},
             "email_layout_template": {"type": "string"},
+            "stats": {
+                "type": ["null", "object"],
+                "properties": {
+                    "recipients": {"type": ["null", "integer"]},
+                    "open_rate": {"type": ["null", "number"]},
+                    "click_rate": {"type": ["null", "number"]},
+                    "unsubscribes": {"type": ["null", "integer"]},
+                    "total_clicks": {"type": ["null", "integer"]},
+                    "show_total_clicks": {"type": ["null", "boolean"]},
+                    "status": {"type": ["null", "string"]},
+                    "progress": {"type": ["null", "number"]},
+                },
+            },
         },
     }
 
@@ -166,6 +188,14 @@ def sync_broadcasts(
             broadcasts = response["broadcasts"]
 
             for broadcast in broadcasts:
+                # Fetch stats for each broadcast
+                try:
+                    stats_response = api.get_broadcast_stats(broadcast["id"])
+                    broadcast["stats"] = stats_response.get("stats")
+                except requests.exceptions.RequestException as e:
+                    LOGGER.warning(f"Error fetching stats for broadcast {broadcast['id']}: {e}")
+                    broadcast["stats"] = None
+
                 # Write record
                 write_record("broadcasts", broadcast)
                 total_records += 1

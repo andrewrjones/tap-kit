@@ -78,9 +78,20 @@ The `broadcasts` stream extracts broadcast data from your Kit account.
 - `thumbnail_url` (string, nullable): Thumbnail URL
 - `email_address` (string): Sender email address
 - `email_layout_template` (string): Email layout template
+- `stats` (object, nullable): Broadcast statistics
+  - `recipients` (integer, nullable): Number of recipients
+  - `open_rate` (number, nullable): Email open rate
+  - `click_rate` (number, nullable): Email click rate
+  - `unsubscribes` (integer, nullable): Number of unsubscribes
+  - `total_clicks` (integer, nullable): Total number of clicks
+  - `show_total_clicks` (boolean, nullable): Whether to show total clicks
+  - `status` (string, nullable): Broadcast status
+  - `progress` (number, nullable): Send progress percentage
 
 **Replication Method:** INCREMENTAL
 **Replication Key:** `created_at`
+
+**Note:** The tap fetches statistics for each broadcast using a separate API call to include real-time performance metrics.
 
 ### Subscribers
 
