@@ -157,7 +157,7 @@ def load_schemas() -> Dict[str, Schema]:
             "public_url": {"type": ["null", "string"]},
             "email_address": {"type": ["null", "string"]},
             "email_template": {"type": ["null", "object"]},
-            "subscriber_filter": {"type": ["null", "array", "object"]},
+            "subscriber_filter": {"type": ["null", "object"]},
             "status": {"type": ["null", "string"]},
         },
     }
