@@ -487,7 +487,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/b7/b0/b4edfdff98a1b5e3f
 
 [[package]]
 name = "singer-tap-kit"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "python-dateutil" },

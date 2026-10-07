@@ -45,6 +45,7 @@ class TestKitAPI:
             "https://api.kit.com/v4/broadcasts",
             headers=api.headers,
             params={"per_page": 100, "after": "CURSOR123"},
+            timeout=60,
         )
 
     @patch("requests.get")
@@ -81,6 +82,47 @@ class TestKitAPI:
 
         assert mock_get.call_count == 2
         mock_sleep.assert_called_once_with(1.0)
+        assert result == {"subscriber": {"id": 1, "stats": {}}}
+
+    @patch("tap_kit.time.sleep", return_value=None)
+    @patch("requests.get")
+    def test_retries_on_server_error(self, mock_get, mock_sleep):
+        server_error = Mock()
+        server_error.status_code = 503
+        server_error.headers = {}
+
+        ok = Mock()
+        ok.status_code = 200
+        ok.headers = {}
+        ok.json.return_value = {"subscriber": {"id": 1, "stats": {}}}
+        ok.raise_for_status.return_value = None
+
+        mock_get.side_effect = [server_error, ok]
+
+        api = KitAPI("test_key")
+        result = api.get_subscriber_stats(1)
+
+        assert mock_get.call_count == 2
+        assert result == {"subscriber": {"id": 1, "stats": {}}}
+
+    @patch("tap_kit.time.sleep", return_value=None)
+    @patch("requests.get")
+    def test_retries_on_connection_error(self, mock_get, mock_sleep):
+        ok = Mock()
+        ok.status_code = 200
+        ok.headers = {}
+        ok.json.return_value = {"subscriber": {"id": 1, "stats": {}}}
+        ok.raise_for_status.return_value = None
+
+        mock_get.side_effect = [
+            requests.exceptions.ConnectionError("boom"),
+            ok,
+        ]
+
+        api = KitAPI("test_key")
+        result = api.get_subscriber_stats(1)
+
+        assert mock_get.call_count == 2
         assert result == {"subscriber": {"id": 1, "stats": {}}}
 
 

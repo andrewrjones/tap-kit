@@ -14,7 +14,8 @@ STATE = {}
 LOGGER = get_logger()
 
 DEFAULT_PER_PAGE = 500
-MAX_RATE_LIMIT_RETRIES = 5
+MAX_RETRIES = 5
+REQUEST_TIMEOUT = 60
 
 STREAM_CONFIG = {
     "broadcasts": {
@@ -59,27 +60,48 @@ class KitAPI:
     def _get(
         self, path: str, params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """GET a path, retrying on rate limit (HTTP 429)."""
+        """GET a path, retrying on rate limit (429), server errors (5xx), and
+        transient network failures with exponential backoff."""
         url = f"{self.base_url}{path}"
 
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            response = requests.get(url, headers=self.headers, params=params)
+        for attempt in range(MAX_RETRIES + 1):
+            last_attempt = attempt == MAX_RETRIES
+            try:
+                response = requests.get(
+                    url, headers=self.headers, params=params, timeout=REQUEST_TIMEOUT
+                )
+            except requests.exceptions.RequestException as e:
+                if last_attempt:
+                    raise
+                wait = 2**attempt
+                LOGGER.warning(
+                    f"Request error on {path}: {e}, retrying in {wait}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                )
+                time.sleep(wait)
+                continue
 
-            if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+            if response.status_code == 429 and not last_attempt:
                 retry_after = response.headers.get("Retry-After")
                 wait = float(retry_after) if retry_after else 2**attempt
                 LOGGER.warning(
                     f"Rate limited on {path}, retrying in {wait}s "
-                    f"(attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES})"
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                )
+                time.sleep(wait)
+                continue
+
+            if response.status_code >= 500 and not last_attempt:
+                wait = 2**attempt
+                LOGGER.warning(
+                    f"Server error {response.status_code} on {path}, retrying in "
+                    f"{wait}s (attempt {attempt + 1}/{MAX_RETRIES})"
                 )
                 time.sleep(wait)
                 continue
 
             response.raise_for_status()
             return response.json()
-
-        response.raise_for_status()
-        return response.json()
 
     def list_broadcasts(
         self, after: Optional[str] = None, per_page: int = DEFAULT_PER_PAGE
@@ -389,12 +411,14 @@ def sync_subscriber_stats(
     )
 
     total_records = 0
+    failed_ids: List[int] = []
 
     for subscriber_id in subscriber_ids:
         try:
             response = api.get_subscriber_stats(subscriber_id)
         except requests.exceptions.RequestException as e:
             LOGGER.warning(f"Error fetching stats for subscriber {subscriber_id}: {e}")
+            failed_ids.append(subscriber_id)
             continue
 
         subscriber = response.get("subscriber") or {}
@@ -407,7 +431,14 @@ def sync_subscriber_stats(
         write_record("subscriber_stats", record)
         total_records += 1
 
-    LOGGER.info(f"Synced {total_records} subscriber_stats records")
+    LOGGER.info(
+        f"Synced {total_records} subscriber_stats records"
+        + (
+            f"; {len(failed_ids)} failed after retries: {failed_ids}"
+            if failed_ids
+            else ""
+        )
+    )
 
 
 def sync(config: Dict[str, Any], state: Dict[str, Any], catalog: Catalog) -> None:
