@@ -5,16 +5,16 @@ A [Singer](https://singer.io) tap for extracting data from the [Kit API](https:/
 ## Installation
 
 ```bash
-pip install tap-kit
+pip install singer-tap-kit
 ```
 
 Or run directly with `uvx`.
 
 ```bash
-uvx tap-kit --help
+uvx --from singer-tap-kit tap-kit --help
 
 # Example with CSV target
-uvx tap-kit --config config.json | uvx --with setuptools target-csv
+uvx --from singer-tap-kit tap-kit --config config.json | uvx --with setuptools target-csv
 ```
 
 ## Configuration

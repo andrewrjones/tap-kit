@@ -1,5 +1,5 @@
 [project]
-name = "tap-kit"
+name = "singer-tap-kit"
 version = "0.1.0"
 description = "Singer.io tap for extracting data from the Kit API"
 readme = "README.md"
@@ -34,6 +34,9 @@ tap-kit = "tap_kit:main"
 [build-system]
 requires = ["uv_build>=0.8.4,<0.9.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "tap_kit"
 
 [dependency-groups]
 dev = [
