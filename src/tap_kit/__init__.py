@@ -1,11 +1,11 @@
 import json
-import os
 import sys
-from typing import Dict, Any
+import time
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
 import requests
 from singer import get_bookmark, write_record, write_schema, get_logger, parse_args
 from singer.catalog import Catalog, CatalogEntry, Schema
-from singer.utils import strptime_to_utc
 
 
 REQUIRED_CONFIG_KEYS = ["api_key"]
@@ -13,146 +13,212 @@ CONFIG = {}
 STATE = {}
 LOGGER = get_logger()
 
+DEFAULT_PER_PAGE = 500
+MAX_RATE_LIMIT_RETRIES = 5
+
+STREAM_CONFIG = {
+    "broadcasts": {
+        "replication_method": "INCREMENTAL",
+        "replication_key": "created_at",
+        "key_properties": ["id"],
+    },
+    "broadcast_stats": {
+        "replication_method": "FULL_TABLE",
+        "replication_key": None,
+        "key_properties": ["id", "synced_at"],
+    },
+    "subscribers": {
+        "replication_method": "INCREMENTAL",
+        "replication_key": "created_at",
+        "key_properties": ["id"],
+    },
+    "subscriber_stats": {
+        "replication_method": "FULL_TABLE",
+        "replication_key": None,
+        "key_properties": ["id", "synced_at"],
+    },
+}
+
+
+def utc_now() -> str:
+    """Current UTC time as an ISO 8601 string, used to stamp stat snapshots."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 class KitAPI:
-    """Client for the Kit API"""
+    """Client for the Kit v4 API"""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.kit.com/v4"
         self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+            "X-Kit-Api-Key": api_key,
+            "Accept": "application/json",
         }
 
-    def get_broadcasts(self, page: int = 1) -> Dict[str, Any]:
-        """Fetch broadcasts from Kit API"""
-        url = f"{self.base_url}/broadcasts"
-        params = {"page": page}
+    def _get(
+        self, path: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """GET a path, retrying on rate limit (HTTP 429)."""
+        url = f"{self.base_url}{path}"
 
-        response = requests.get(url, headers=self.headers, params=params)
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            response = requests.get(url, headers=self.headers, params=params)
+
+            if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+                retry_after = response.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else 2**attempt
+                LOGGER.warning(
+                    f"Rate limited on {path}, retrying in {wait}s "
+                    f"(attempt {attempt + 1}/{MAX_RATE_LIMIT_RETRIES})"
+                )
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
         response.raise_for_status()
-
         return response.json()
 
-    def get_broadcast_stats(self, broadcast_id: int) -> Dict[str, Any]:
-        """Fetch stats for a specific broadcast from Kit API"""
-        url = f"{self.base_url}/broadcasts/{broadcast_id}/stats"
+    def list_broadcasts(
+        self, after: Optional[str] = None, per_page: int = DEFAULT_PER_PAGE
+    ) -> Dict[str, Any]:
+        """Fetch a page of broadcasts."""
+        params = {"per_page": per_page}
+        if after:
+            params["after"] = after
+        return self._get("/broadcasts", params)
 
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+    def list_broadcast_stats(
+        self, after: Optional[str] = None, per_page: int = DEFAULT_PER_PAGE
+    ) -> Dict[str, Any]:
+        """Fetch a page of broadcast stats (batch endpoint)."""
+        params = {"per_page": per_page}
+        if after:
+            params["after"] = after
+        return self._get("/broadcasts/stats", params)
 
-        return response.json()
-
-    def get_subscribers(self, page: int = 1) -> Dict[str, Any]:
-        """Fetch subscribers from Kit API"""
-        url = f"{self.base_url}/subscribers"
-        params = {"page": page}
-
-        response = requests.get(url, headers=self.headers, params=params)
-        response.raise_for_status()
-
-        return response.json()
+    def list_subscribers(
+        self, after: Optional[str] = None, per_page: int = DEFAULT_PER_PAGE
+    ) -> Dict[str, Any]:
+        """Fetch a page of subscribers."""
+        params = {"per_page": per_page}
+        if after:
+            params["after"] = after
+        return self._get("/subscribers", params)
 
     def get_subscriber_stats(self, subscriber_id: int) -> Dict[str, Any]:
-        """Fetch stats for a specific subscriber from Kit API"""
-        url = f"{self.base_url}/subscribers/{subscriber_id}/stats"
-
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-
-        return response.json()
-
-
-def get_abs_path(path: str) -> str:
-    """Get absolute path"""
-    return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
+        """Fetch stats for a single subscriber."""
+        return self._get(f"/subscribers/{subscriber_id}/stats")
 
 
 def load_schemas() -> Dict[str, Schema]:
-    """Load schemas from schemas folder"""
+    """Define schemas for each stream."""
     schemas = {}
 
-    # Define broadcast schema based on Kit API documentation
     broadcast_schema = {
         "type": "object",
         "properties": {
             "id": {"type": "integer"},
+            "publication_id": {"type": ["null", "integer"]},
             "created_at": {"type": "string", "format": "date-time"},
-            "subject": {"type": "string"},
-            "description": {"type": "string"},
-            "content": {"type": "string"},
-            "public": {"type": "boolean"},
+            "subject": {"type": ["null", "string"]},
+            "preview_text": {"type": ["null", "string"]},
+            "description": {"type": ["null", "string"]},
+            "content": {"type": ["null", "string"]},
+            "public": {"type": ["null", "boolean"]},
             "published_at": {"type": ["null", "string"], "format": "date-time"},
             "send_at": {"type": ["null", "string"], "format": "date-time"},
             "thumbnail_alt": {"type": ["null", "string"]},
             "thumbnail_url": {"type": ["null", "string"]},
-            "email_address": {"type": "string"},
-            "email_layout_template": {"type": "string"},
-            "stats": {
-                "type": ["null", "object"],
-                "properties": {
-                    "recipients": {"type": ["null", "integer"]},
-                    "open_rate": {"type": ["null", "number"]},
-                    "click_rate": {"type": ["null", "number"]},
-                    "unsubscribes": {"type": ["null", "integer"]},
-                    "total_clicks": {"type": ["null", "integer"]},
-                    "show_total_clicks": {"type": ["null", "boolean"]},
-                    "status": {"type": ["null", "string"]},
-                    "progress": {"type": ["null", "number"]},
-                },
-            },
+            "public_url": {"type": ["null", "string"]},
+            "email_address": {"type": ["null", "string"]},
+            "email_template": {"type": ["null", "object"]},
+            "subscriber_filter": {"type": ["null", "array", "object"]},
+            "status": {"type": ["null", "string"]},
         },
     }
 
-    # Define subscriber schema based on Kit API documentation
+    broadcast_stats_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "synced_at": {"type": "string", "format": "date-time"},
+            "recipients": {"type": ["null", "integer"]},
+            "open_rate": {"type": ["null", "number"]},
+            "emails_opened": {"type": ["null", "integer"]},
+            "click_rate": {"type": ["null", "number"]},
+            "unsubscribe_rate": {"type": ["null", "number"]},
+            "unsubscribes": {"type": ["null", "integer"]},
+            "total_clicks": {"type": ["null", "integer"]},
+            "show_total_clicks": {"type": ["null", "boolean"]},
+            "status": {"type": ["null", "string"]},
+            "progress": {"type": ["null", "number"]},
+            "open_tracking_disabled": {"type": ["null", "boolean"]},
+            "click_tracking_disabled": {"type": ["null", "boolean"]},
+        },
+    }
+
     subscriber_schema = {
         "type": "object",
         "properties": {
             "id": {"type": "integer"},
             "first_name": {"type": ["null", "string"]},
             "email_address": {"type": "string"},
-            "state": {"type": "string"},
+            "state": {"type": ["null", "string"]},
             "created_at": {"type": "string", "format": "date-time"},
-            "fields": {"type": "object"},
-            "stats": {
-                "type": ["null", "object"],
-                "properties": {
-                    "total_opens": {"type": ["null", "integer"]},
-                    "total_clicks": {"type": ["null", "integer"]},
-                    "average_open_rate": {"type": ["null", "number"]},
-                    "average_click_rate": {"type": ["null", "number"]},
-                },
-            },
+            "fields": {"type": ["null", "object"]},
+        },
+    }
+
+    subscriber_stats_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "synced_at": {"type": "string", "format": "date-time"},
+            "sent": {"type": ["null", "integer"]},
+            "opened": {"type": ["null", "integer"]},
+            "clicked": {"type": ["null", "integer"]},
+            "bounced": {"type": ["null", "integer"]},
+            "open_rate": {"type": ["null", "number"]},
+            "click_rate": {"type": ["null", "number"]},
+            "last_sent": {"type": ["null", "string"], "format": "date-time"},
+            "last_opened": {"type": ["null", "string"], "format": "date-time"},
+            "last_clicked": {"type": ["null", "string"], "format": "date-time"},
+            "sends_since_last_open": {"type": ["null", "integer"]},
+            "sends_since_last_click": {"type": ["null", "integer"]},
         },
     }
 
     schemas["broadcasts"] = Schema.from_dict(broadcast_schema)
+    schemas["broadcast_stats"] = Schema.from_dict(broadcast_stats_schema)
     schemas["subscribers"] = Schema.from_dict(subscriber_schema)
+    schemas["subscriber_stats"] = Schema.from_dict(subscriber_stats_schema)
 
     return schemas
 
 
 def discover() -> Catalog:
-    """Discover available streams and schemas"""
+    """Discover available streams and schemas."""
     schemas = load_schemas()
     streams = []
 
     for stream_id, schema in schemas.items():
-        key_properties = ["id"]
-        replication_key = "created_at"
+        stream_settings = STREAM_CONFIG[stream_id]
+        replication_method = stream_settings["replication_method"]
+        replication_key = stream_settings["replication_key"]
+        key_properties = stream_settings["key_properties"]
 
-        stream_metadata = [
-            {
-                "metadata": {
-                    "inclusion": "available",
-                    "table-key-properties": key_properties,
-                    "valid-replication-keys": [replication_key],
-                    "schema-name": stream_id,
-                },
-                "breadcrumb": [],
-            }
-        ]
+        metadata_entry = {
+            "inclusion": "available",
+            "table-key-properties": key_properties,
+            "schema-name": stream_id,
+        }
+        if replication_key:
+            metadata_entry["valid-replication-keys"] = [replication_key]
+
+        stream_metadata = [{"metadata": metadata_entry, "breadcrumb": []}]
 
         catalog_entry = CatalogEntry(
             stream=stream_id,
@@ -161,7 +227,7 @@ def discover() -> Catalog:
             key_properties=key_properties,
             replication_key=replication_key,
             metadata=stream_metadata,
-            replication_method="INCREMENTAL",
+            replication_method=replication_method,
         )
 
         streams.append(catalog_entry)
@@ -172,144 +238,197 @@ def discover() -> Catalog:
 def sync_broadcasts(
     config: Dict[str, Any], state: Dict[str, Any], catalog: Catalog
 ) -> None:
-    """Sync broadcasts stream"""
+    """Sync broadcasts stream (entity records, no stats)."""
     api = KitAPI(config["api_key"])
 
-    # Get the broadcasts stream from catalog
     broadcasts_catalog = catalog.get_stream("broadcasts")
     if not broadcasts_catalog:
         LOGGER.error("Broadcasts stream not found in catalog")
         return
 
-    bookmark_column = broadcasts_catalog.replication_key
-
-    start = get_bookmark(
-        state, "broadcasts", bookmark_column, config.get("start_date")
+    get_bookmark(
+        state,
+        "broadcasts",
+        broadcasts_catalog.replication_key,
+        config.get("start_date"),
     )
-    if start:
-        start = strptime_to_utc(start)
 
     write_schema(
-        "broadcasts", broadcasts_catalog.schema.to_dict(), key_properties=["id"]
+        "broadcasts",
+        broadcasts_catalog.schema.to_dict(),
+        key_properties=broadcasts_catalog.key_properties,
     )
 
-    page = 1
+    after = None
     total_records = 0
 
     while True:
-        try:
-            response = api.get_broadcasts(page=page)
+        response = api.list_broadcasts(after=after)
+        broadcasts = response.get("broadcasts") or []
 
-            if not response.get("broadcasts"):
-                break
+        for broadcast in broadcasts:
+            write_record("broadcasts", broadcast)
+            total_records += 1
 
-            broadcasts = response["broadcasts"]
-
-            for broadcast in broadcasts:
-                # Fetch stats for each broadcast
-                try:
-                    stats_response = api.get_broadcast_stats(broadcast["id"])
-                    broadcast["stats"] = stats_response.get("stats")
-                except requests.exceptions.RequestException as e:
-                    LOGGER.warning(f"Error fetching stats for broadcast {broadcast['id']}: {e}")
-                    broadcast["stats"] = None
-
-                # Write record
-                write_record("broadcasts", broadcast)
-                total_records += 1
-
-            # Check if we have more pages
-            total_broadcasts = response.get("total_broadcasts", 0)
-            page_info = response.get("page", 1)
-            
-            if page * 50 >= total_broadcasts:  # Kit API default page size is 50
-                break
-
-            page += 1
-
-        except requests.exceptions.RequestException as e:
-            LOGGER.error(f"Error fetching broadcasts: {e}")
+        pagination = response.get("pagination") or {}
+        if not pagination.get("has_next_page"):
+            break
+        after = pagination.get("end_cursor")
+        if not after:
             break
 
     LOGGER.info(f"Synced {total_records} broadcast records")
 
 
-def sync_subscribers(
-    config: Dict[str, Any], state: Dict[str, Any], catalog: Catalog
+def sync_broadcast_stats(
+    config: Dict[str, Any], catalog: Catalog, synced_at: str
 ) -> None:
-    """Sync subscribers stream"""
+    """Sync broadcast_stats snapshot stream via the batch stats endpoint."""
     api = KitAPI(config["api_key"])
 
-    # Get the subscribers stream from catalog
-    subscribers_catalog = catalog.get_stream("subscribers")
-    if not subscribers_catalog:
-        LOGGER.error("Subscribers stream not found in catalog")
+    stats_catalog = catalog.get_stream("broadcast_stats")
+    if not stats_catalog:
+        LOGGER.error("Broadcast_stats stream not found in catalog")
         return
 
-    bookmark_column = subscribers_catalog.replication_key
-
-    start = get_bookmark(
-        state, "subscribers", bookmark_column, config.get("start_date")
-    )
-    if start:
-        start = strptime_to_utc(start)
-
     write_schema(
-        "subscribers", subscribers_catalog.schema.to_dict(), key_properties=["id"]
+        "broadcast_stats",
+        stats_catalog.schema.to_dict(),
+        key_properties=stats_catalog.key_properties,
     )
 
-    page = 1
+    after = None
     total_records = 0
 
     while True:
-        try:
-            response = api.get_subscribers(page=page)
+        response = api.list_broadcast_stats(after=after)
+        broadcasts = response.get("broadcasts") or []
 
-            if not response.get("subscribers"):
-                break
+        for broadcast in broadcasts:
+            stats = broadcast.get("stats") or {}
+            record = {"id": broadcast["id"], "synced_at": synced_at, **stats}
+            write_record("broadcast_stats", record)
+            total_records += 1
 
-            subscribers = response["subscribers"]
+        pagination = response.get("pagination") or {}
+        if not pagination.get("has_next_page"):
+            break
+        after = pagination.get("end_cursor")
+        if not after:
+            break
 
-            for subscriber in subscribers:
-                # Fetch stats for each subscriber
-                try:
-                    stats_response = api.get_subscriber_stats(subscriber["id"])
-                    subscriber["stats"] = stats_response.get("stats")
-                except requests.exceptions.RequestException as e:
-                    LOGGER.warning(f"Error fetching stats for subscriber {subscriber['id']}: {e}")
-                    subscriber["stats"] = None
+    LOGGER.info(f"Synced {total_records} broadcast_stats records")
 
-                # Write record
-                write_record("subscribers", subscriber)
-                total_records += 1
 
-            # Check if we have more pages
-            total_subscribers = response.get("total_subscribers", 0)
-            page_info = response.get("page", 1)
-            
-            if page * 50 >= total_subscribers:  # Kit API default page size is 50
-                break
+def sync_subscribers(
+    config: Dict[str, Any], state: Dict[str, Any], catalog: Catalog
+) -> List[int]:
+    """Sync subscribers stream. Returns the list of subscriber ids seen."""
+    api = KitAPI(config["api_key"])
 
-            page += 1
+    subscribers_catalog = catalog.get_stream("subscribers")
+    if not subscribers_catalog:
+        LOGGER.error("Subscribers stream not found in catalog")
+        return []
 
-        except requests.exceptions.RequestException as e:
-            LOGGER.error(f"Error fetching subscribers: {e}")
+    get_bookmark(
+        state,
+        "subscribers",
+        subscribers_catalog.replication_key,
+        config.get("start_date"),
+    )
+
+    write_schema(
+        "subscribers",
+        subscribers_catalog.schema.to_dict(),
+        key_properties=subscribers_catalog.key_properties,
+    )
+
+    after = None
+    total_records = 0
+    subscriber_ids: List[int] = []
+
+    while True:
+        response = api.list_subscribers(after=after)
+        subscribers = response.get("subscribers") or []
+
+        for subscriber in subscribers:
+            write_record("subscribers", subscriber)
+            subscriber_ids.append(subscriber["id"])
+            total_records += 1
+
+        pagination = response.get("pagination") or {}
+        if not pagination.get("has_next_page"):
+            break
+        after = pagination.get("end_cursor")
+        if not after:
             break
 
     LOGGER.info(f"Synced {total_records} subscriber records")
+    return subscriber_ids
+
+
+def sync_subscriber_stats(
+    config: Dict[str, Any],
+    catalog: Catalog,
+    subscriber_ids: List[int],
+    synced_at: str,
+) -> None:
+    """Sync subscriber_stats snapshot stream (one API call per subscriber)."""
+    api = KitAPI(config["api_key"])
+
+    stats_catalog = catalog.get_stream("subscriber_stats")
+    if not stats_catalog:
+        LOGGER.error("Subscriber_stats stream not found in catalog")
+        return
+
+    write_schema(
+        "subscriber_stats",
+        stats_catalog.schema.to_dict(),
+        key_properties=stats_catalog.key_properties,
+    )
+
+    total_records = 0
+
+    for subscriber_id in subscriber_ids:
+        try:
+            response = api.get_subscriber_stats(subscriber_id)
+        except requests.exceptions.RequestException as e:
+            LOGGER.warning(f"Error fetching stats for subscriber {subscriber_id}: {e}")
+            continue
+
+        subscriber = response.get("subscriber") or {}
+        stats = subscriber.get("stats") or {}
+        record = {
+            "id": subscriber.get("id", subscriber_id),
+            "synced_at": synced_at,
+            **stats,
+        }
+        write_record("subscriber_stats", record)
+        total_records += 1
+
+    LOGGER.info(f"Synced {total_records} subscriber_stats records")
 
 
 def sync(config: Dict[str, Any], state: Dict[str, Any], catalog: Catalog) -> None:
-    """Sync all streams"""
-    for stream in catalog.streams:
-        if stream.tap_stream_id == "broadcasts":
-            sync_broadcasts(config, state, catalog)
-        elif stream.tap_stream_id == "subscribers":
-            sync_subscribers(config, state, catalog)
+    """Sync all selected streams."""
+    stream_ids = {stream.tap_stream_id for stream in catalog.streams}
+    synced_at = utc_now()
+
+    if "broadcasts" in stream_ids:
+        sync_broadcasts(config, state, catalog)
+
+    if "broadcast_stats" in stream_ids:
+        sync_broadcast_stats(config, catalog, synced_at)
+
+    if "subscribers" in stream_ids or "subscriber_stats" in stream_ids:
+        subscriber_ids = sync_subscribers(config, state, catalog)
+        if "subscriber_stats" in stream_ids:
+            sync_subscriber_stats(config, catalog, subscriber_ids, synced_at)
 
 
 def main() -> None:
-    """Main entry point"""
+    """Main entry point."""
     args = parse_args(REQUIRED_CONFIG_KEYS)
 
     config = args.config

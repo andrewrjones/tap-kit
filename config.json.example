@@ -1,3 +1,4 @@
 {
-  "api_key": "your_kit_api_key_here"
+  "api_key": "your_kit_v4_api_key_here",
+  "start_date": "2024-01-01T00:00:00Z"
 }
